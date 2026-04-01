@@ -178,7 +178,12 @@ def create_booking(
 
 
 def get_active_bookings_for_user(telegram_id: int) -> list[dict]:
-    """Return active bookings for a user with slot and service data joined."""
+    """Return active future bookings for a user with slot and service data joined."""
+    import pytz
+    now = datetime.now(pytz.timezone(config.TIMEZONE))
+    today_str = now.date().isoformat()
+    now_time_str = now.strftime("%H:%M")
+
     res = (
         get_client()
         .table("bookings")
@@ -188,7 +193,16 @@ def get_active_bookings_for_user(telegram_id: int) -> list[dict]:
         .order("created_at", desc=False)
         .execute()
     )
-    return res.data or []
+    result = []
+    for b in (res.data or []):
+        slot = b.get("slots") or {}
+        slot_date = slot.get("slot_date", "")
+        slot_time = str(slot.get("slot_time", "00:00"))[:5]
+        if slot_date > today_str:
+            result.append(b)
+        elif slot_date == today_str and slot_time >= now_time_str:
+            result.append(b)
+    return result
 
 
 def get_booking_by_id(booking_id: str) -> Optional[dict]:

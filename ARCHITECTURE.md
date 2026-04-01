@@ -68,14 +68,33 @@ Client Telegram message
   → response to client
 ```
 
-## AI extension points (v2)
+## AI module (activated via AI_ENABLED=true)
 
-- `services/ai_service.py` — all stubs, activated via `AI_ENABLED=true`
-- `enter_name` accepts free text — AI normalisation plugs in transparently
-- `share_phone` uses Telegram contact sharing; in v2 AI can also parse text phone input as fallback
-- `select_date` / `select_time` — will add text branch → `ai_service.parse_datetime()` → same callback path
-- `MAIN_MENU` text input → `ai_service.detect_intent()` → route to FSM state
-- RAG: pgvector extension in same Supabase project, no new services needed
+Provider is selected via `AI_PROVIDER=openai|gigachat` in `.env`.
+
+| Function | Called when | Returns |
+|---|---|---|
+| `detect_intent(text)` | Client writes free text in main menu | `start_booking` / `my_bookings` / `faq` / `None` |
+| `parse_datetime(text)` | Client writes date/time instead of using buttons | `("YYYY-MM-DD", "HH:MM-HH:MM")` |
+| `answer_faq(question)` | Client asks about services, prices, aftercare | Text answer |
+| `parse_schedule(text)` | Master adds slots via free text | `[{slot_date, slot_time}]` |
+
+System prompts: `services/prompts.py`
+Knowledge base (services, prices, FAQ): `services/knowledge.py`
+
+**Typing indicator** must be sent before every AI call:
+```python
+await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+```
+
+**Data flow with AI:**
+```
+Client free text
+  → send_chat_action(TYPING)
+  → ai_service.detect_intent / parse_datetime / answer_faq
+    → _chat() → AI_PROVIDER == "gigachat" ? GigaChat : OpenAI
+  → result fed into existing FSM callback path
+```
 
 ## Google Calendar setup
 

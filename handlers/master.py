@@ -19,9 +19,10 @@ from datetime import date, timedelta
 from typing import Optional
 
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.enums import ChatAction
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.types import (
     CallbackQuery,
     Message,
@@ -30,7 +31,7 @@ from aiogram.types import (
 )
 
 import config
-from services import db, calendar as cal
+from services import db, calendar as cal, ai_service
 
 router = Router()
 
@@ -59,6 +60,8 @@ class MasterFSM(StatesGroup):
     # post-save
     after_save = State()
     select_weekdays = State()
+    # ai free-text slot parsing
+    confirm_ai_slots = State()
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +399,9 @@ async def master_confirm_period_text(message: Message) -> None:
 
 @router.callback_query(MasterFSM.confirm_period, F.data == "mconfirm_period")
 async def master_confirm_period(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await callback.message.edit_text("⏳ Сохраняю слоты...")
+
     data = await state.get_data()
     slots = data.get("period_slots", [])
     saved = await _save_slots(data["slot_date"], slots)
@@ -412,7 +418,6 @@ async def master_confirm_period(callback: CallbackQuery, state: FSMContext) -> N
         text = f"⚠️ Все слоты на {data['slot_date']} уже существуют.\n\nЧто дальше?"
 
     await callback.message.edit_text(text, reply_markup=_after_save_kb())
-    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +436,8 @@ async def master_after_save(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "tomorrow":
+        await callback.answer()
+        await callback.message.edit_text("⏳ Копирую на завтра...")
         tomorrow = (date.fromisoformat(data["slot_date"]) + timedelta(days=1)).isoformat()
         saved = await _save_slots(tomorrow, data.get("saved_times", []))
         if saved:
@@ -438,7 +445,6 @@ async def master_after_save(callback: CallbackQuery, state: FSMContext) -> None:
         else:
             text = f"⚠️ Слоты на {tomorrow} уже существуют.\n\nЧто дальше?"
         await callback.message.edit_text(text, reply_markup=_after_save_kb())
-        await callback.answer()
         return
 
     if action == "weekdays":
@@ -471,6 +477,9 @@ async def master_weekday_toggle(callback: CallbackQuery, state: FSMContext) -> N
             await callback.answer("Выберите хотя бы один день!", show_alert=True)
             return
 
+        await callback.answer()
+        await callback.message.edit_text("⏳ Копирую слоты...")
+
         results: list[str] = []
         for idx in selected:
             d = week_dates[idx].isoformat()
@@ -486,7 +495,6 @@ async def master_weekday_toggle(callback: CallbackQuery, state: FSMContext) -> N
         await state.update_data(weekday_selected=[])
         await state.set_state(MasterFSM.after_save)
         await callback.message.edit_text(text, reply_markup=_after_save_kb())
-        await callback.answer()
         return
 
     # Toggle day
@@ -500,3 +508,67 @@ async def master_weekday_toggle(callback: CallbackQuery, state: FSMContext) -> N
         reply_markup=_weekdays_kb(selected, week_dates)
     )
     await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# AI: free-text slot parsing for master (parse_schedule)
+# ---------------------------------------------------------------------------
+
+def _ai_slots_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сохранить все", callback_data="mai_confirm")],
+        [CANCEL_BTN],
+    ])
+
+
+@router.message(StateFilter(default_state), F.text, ~F.text.startswith("/"))
+async def master_free_text(message: Message, state: FSMContext) -> None:
+    if not _is_master(message.from_user.id):
+        return
+    if not ai_service.is_enabled():
+        await message.answer("Используйте /addslots для добавления слотов.")
+        return
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    slots = await ai_service.parse_schedule(message.text)
+
+    if not slots:
+        await message.answer(
+            "Не удалось распознать слоты. Попробуйте иначе или используйте /addslots.\n\n"
+            "Пример: «добавь слоты на завтра с 10:00 до 14:00»"
+        )
+        return
+
+    lines = [f"• {s['slot_date']} в {s['slot_time']}" for s in slots]
+    await state.update_data(ai_slots=slots)
+    await state.set_state(MasterFSM.confirm_ai_slots)
+    await message.answer(
+        f"Распознано {len(slots)} слот(ов):\n" + "\n".join(lines) + "\n\nСохранить?",
+        reply_markup=_ai_slots_confirm_kb(),
+    )
+
+
+@router.callback_query(MasterFSM.confirm_ai_slots, F.data == "mai_confirm")
+async def master_ai_slots_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await callback.message.edit_text("⏳ Сохраняю слоты...")
+
+    data = await state.get_data()
+    slots = data.get("ai_slots", [])
+
+    from itertools import groupby
+    slots_sorted = sorted(slots, key=lambda s: (s["slot_date"], s["slot_time"]))
+
+    saved_all: list[str] = []
+    for slot_date, group in groupby(slots_sorted, key=lambda s: s["slot_date"]):
+        times = [s["slot_time"] for s in group]
+        saved = await _save_slots(slot_date, times)
+        saved_all.extend(f"{slot_date} {t}" for t in saved)
+
+    await state.clear()
+    if saved_all:
+        await callback.message.edit_text(
+            f"✅ Сохранено {len(saved_all)} слот(ов):\n" + "\n".join(f"• {s}" for s in saved_all)
+        )
+    else:
+        await callback.message.edit_text("⚠️ Все эти слоты уже существуют.")

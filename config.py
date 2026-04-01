@@ -25,11 +25,15 @@ GOOGLE_CREDENTIALS_JSON: str = _require("GOOGLE_CREDENTIALS_JSON")
 CALENDAR_SLOTS_ID: str = _require("CALENDAR_SLOTS_ID")
 CALENDAR_BOOKINGS_ID: str = _require("CALENDAR_BOOKINGS_ID")
 
-# AI module toggle (reserved for v2)
+# AI module
 AI_ENABLED: bool = os.getenv("AI_ENABLED", "false").lower() == "true"
+# AI_PROVIDER: "openai" or "gigachat"
+AI_PROVIDER: str = os.getenv("AI_PROVIDER", "openai").lower()
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+GIGACHAT_CREDENTIALS: str = os.getenv("GIGACHAT_CREDENTIALS", "")
 
 # Timezone for all date/time operations
-TIMEZONE = "Europe/Moscow"
+TIMEZONE = "Asia/Tomsk"
 
 # Reminder intervals in hours
 REMINDER_HOURS = [24, 2]

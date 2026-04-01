@@ -10,9 +10,10 @@ Phone is collected via Telegram's native contact-sharing button (no manual typin
 from __future__ import annotations
 
 from aiogram import Router, F, Bot
-from aiogram.filters import Command
+from aiogram.enums import ChatAction
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -23,7 +24,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from services import db, calendar as cal, notifications
+from services import db, calendar as cal, notifications, ai_service
 
 router = Router()
 
@@ -208,6 +209,27 @@ async def step_service_chosen(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.message(BookingFSM.select_date, ~F.text.startswith("/"))
 async def step_select_date_text(message: Message, state: FSMContext) -> None:
+    if ai_service.is_enabled():
+        await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        result = await ai_service.parse_datetime(message.text)
+        if result:
+            date_str, _ = result
+            if date_str:
+                slots = db.get_free_slots_for_date(date_str)
+                if slots:
+                    await state.update_data(slot_date=date_str)
+                    await state.set_state(BookingFSM.select_time)
+                    await message.answer(
+                        f"Дата: <b>{_fmt_date(date_str)}</b>\n\nВыберите время:",
+                        parse_mode="HTML",
+                        reply_markup=_times_kb(slots),
+                    )
+                    return
+                await message.answer(
+                    f"На {_fmt_date(date_str)} нет свободных слотов. Выберите другую дату:",
+                    reply_markup=_dates_kb(db.get_free_slots_dates()),
+                )
+                return
     await message.answer(
         "Пожалуйста, используйте кнопки ниже 👇",
         reply_markup=_dates_kb(db.get_free_slots_dates()),
@@ -245,6 +267,31 @@ async def step_date_chosen(callback: CallbackQuery, state: FSMContext) -> None:
 async def step_select_time_text(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     slots = db.get_free_slots_for_date(data["slot_date"])
+    if ai_service.is_enabled():
+        await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        result = await ai_service.parse_datetime(message.text)
+        if result:
+            _, time_range = result
+            if time_range:
+                start_time = time_range.split("-")[0].strip()
+                matching = next((s for s in slots if str(s["slot_time"])[:5] == start_time), None)
+                if matching:
+                    await state.update_data(
+                        slot_id=str(matching["id"]),
+                        slot_time=start_time,
+                    )
+                    await state.set_state(BookingFSM.enter_name)
+                    await message.answer(
+                        f"Время: <b>{start_time}</b>\n\nВведите ваше имя:",
+                        parse_mode="HTML",
+                        reply_markup=_cancel_kb(),
+                    )
+                    return
+                await message.answer(
+                    f"Время {start_time} недоступно. Выберите из списка:",
+                    reply_markup=_times_kb(slots),
+                )
+                return
     await message.answer(
         "Пожалуйста, используйте кнопки ниже 👇",
         reply_markup=_times_kb(slots),
@@ -381,3 +428,64 @@ async def step_confirm_text(message: Message) -> None:
         "Пожалуйста, используйте кнопки ниже 👇",
         reply_markup=_confirm_kb(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Catch-all: free text in main menu (no FSM state) → AI detect_intent
+# ---------------------------------------------------------------------------
+
+@router.message(StateFilter(default_state), F.text, ~F.text.startswith("/"))
+async def main_menu_free_text(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not ai_service.is_enabled():
+        await message.answer("Выберите действие:", reply_markup=_main_menu_kb())
+        return
+
+    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    intent = await ai_service.detect_intent(message.text)
+
+    if intent == "start_booking":
+        services = db.get_services()
+        if not services:
+            await message.answer(
+                "Список услуг недоступен. Попробуйте позже.",
+                reply_markup=_main_menu_kb(),
+            )
+            return
+        await state.set_state(BookingFSM.select_service)
+        await message.answer("Выберите услугу:", reply_markup=_services_kb(services))
+
+    elif intent == "my_bookings":
+        bookings = db.get_active_bookings_for_user(message.from_user.id)
+        if not bookings:
+            await message.answer(
+                "У вас нет активных записей.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💅 Записаться", callback_data="start_booking")],
+                ]),
+            )
+        else:
+            rows = []
+            for b in bookings:
+                slot = b.get("slots", {})
+                svc = b.get("services", {})
+                label = (
+                    f"{svc.get('name', '?')} — "
+                    f"{_fmt_date(slot.get('slot_date', ''))} "
+                    f"{str(slot.get('slot_time', ''))[:5]}"
+                )
+                rows.append([InlineKeyboardButton(
+                    text=label, callback_data=f"booking_action:{b['id']}"
+                )])
+            rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="cancel_to_menu")])
+            await message.answer(
+                "Ваши активные записи:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+
+    elif intent == "faq":
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        answer = await ai_service.answer_faq(message.text)
+        await message.answer(answer or "Уточните у мастера 🙏", reply_markup=_main_menu_kb())
+
+    else:
+        await message.answer("Выберите действие:", reply_markup=_main_menu_kb())
